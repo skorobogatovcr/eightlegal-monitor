@@ -1,0 +1,88 @@
+# Мониторинг eightlegal.ru раз в 5 минут (ТЗ, п. 5): страница и посадочная отвечают 200,
+# обработчик заявок жив (GET /api/lead?health=1) и принимает POST (на пустую заявку — 422).
+# Уведомление в Telegram — только при смене состояния: «упал» и «снова работает».
+# Секреты репозитория: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.
+name: monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Прислать тестовое уведомление о падении"
+        type: boolean
+        default: false
+
+concurrency: monitor
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Предыдущее состояние
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: monitor-state-${{ github.run_id }}
+          restore-keys: monitor-state-
+
+      - name: Проверка сайта
+        id: check
+        run: |
+          problems=""
+          check() { # url, ожидаемый код, [метод]
+            for attempt in 1 2; do
+              if [ "${3:-GET}" = POST ]; then
+                code=$(curl -s -o /tmp/body -m 20 -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{}' "$1" || echo 000)
+              else
+                code=$(curl -s -o /tmp/body -m 20 -w '%{http_code}' "$1" || echo 000)
+              fi
+              [ "$code" = "$2" ] && return 0
+              sleep 10
+            done
+            problems="$problems
+          $1 → $code (ждали $2)"
+          }
+          check https://eightlegal.ru/ 200
+          check https://eightlegal.ru/lp/bankrotstvo/ 200
+          check "https://eightlegal.ru/api/lead?health=1" 200
+          grep -q '"ok":true' /tmp/body || problems="$problems
+          обработчик заявок: $(head -c 200 /tmp/body)"
+          check https://eightlegal.ru/api/lead 422 POST
+          {
+            echo "problems<<EOF"
+            echo "$problems"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Уведомление
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PROBLEMS: ${{ steps.check.outputs.problems }}
+          TEST: ${{ inputs.test }}
+        run: |
+          mkdir -p state
+          before=$(cat state/status 2>/dev/null || echo ok)
+          now=$([ -n "$(echo "$PROBLEMS" | tr -d '[:space:]')" ] && echo down || echo ok)
+          send() { curl -s -m 20 -o /dev/null "https://api.telegram.org/bot$TOKEN/sendMessage" --data-urlencode "chat_id=$CHAT" --data-urlencode "text=$1"; }
+          if [ "$TEST" = "true" ]; then
+            send "🧪 Тест мониторинга: так придёт сообщение, если eightlegal.ru упадёт. Сейчас сайт: $now"
+          elif [ "$now" = down ] && [ "$before" = ok ]; then
+            send "🔴 eightlegal.ru: проблема$PROBLEMS
+
+          Заявки с сайта могут не доходить — проверьте сайт."
+          elif [ "$now" = ok ] && [ "$before" = down ]; then
+            send "🟢 eightlegal.ru снова работает"
+          fi
+          echo "$now" > state/status
+          echo "Состояние: $now"
+
+      - name: Сохранить состояние
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: monitor-state-${{ github.run_id }}
